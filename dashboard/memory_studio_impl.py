@@ -423,49 +423,41 @@ def limbic_forget(fact_id: int) -> Dict[str, Any]:
 
 
 def limbic_recall_test(query: str, limit: int = 8, user_id: str = 'anthony') -> Dict[str, Any]:
+    """Rank this user's limbic facts against a query.
+
+    Similarity is limbic's own KNN over vec_index (cosine distance, Arctic Embed),
+    combined with the Memory Studio FSRS view: 0.75 * similarity * R(t,S) + 0.25 * trust.
+    This approximates, but is not, limbic's live prefetch (which also applies its
+    adaptive relevance floor).
+    """
+    import sqlite_vec
     q = (query or '').strip()
     if not q:
         return {'query': '', 'results': []}
     t0 = time.time()
-    limbic_dir = str(HERMES_HOME / 'plugins' / 'limbic')
-    if limbic_dir not in sys.path:
-        sys.path.insert(0, limbic_dir)
-    from store_sqlite import SQLiteStore
-
-    emb = _get_limbic_embedder()
-    qvec = emb.embed(q)
-    store = SQLiteStore(str(HERMES_HOME / 'limbic.db'))
+    qvec = _get_limbic_embedder().embed(q)
+    con = _connect_limbic()
     try:
-        vec_hits = store.search_vector(qvec, top_k=max(limit * 2, 12), user_id=user_id or 'anthony')
-    except Exception:
-        vec_hits = []
+        rows = con.execute(
+            'SELECT rowid, distance FROM vec_index WHERE embedding MATCH ? ORDER BY distance LIMIT ?',
+            (sqlite_vec.serialize_float32(qvec), max(limit * 3, 20)),
+        ).fetchall()
     finally:
-        store.close()
-
-    sim_by_id: Dict[int, float] = {}
-    for h in vec_hits:
-        fid = int(h.get('fact_id', 0))
-        dist = float(h.get('distance', 0.5))
-        sim = max(0.05, min(1.0, 1.0 / (1.0 + dist))) if dist > 1.0 else max(0.05, min(1.0, 1.0 - dist / 2.0))
-        sim_by_id[fid] = sim
+        con.close()
+    sim_by_id = {int(fid): max(0.0, 1.0 - float(dist)) for fid, dist in rows}
 
     payload = get_limbic_payload()
-    q_words = [w for w in ''.join(ch.lower() if ch.isalnum() else ' ' for ch in q).split() if len(w) >= 2]
     results = []
     for f in payload['facts']:
-        fid = f['fact_id']
-        sim = sim_by_id.get(fid, 0.25)
-        hay = f['content'].lower()
-        kw_matches = sum(1 for w in q_words if w in hay)
-        if kw_matches > 0:
-            sim = min(1.0, sim + 0.12 * kw_matches)
+        if user_id and f.get('user_id') != user_id:
+            continue
+        sim = sim_by_id.get(f['fact_id'], 0.0)
         rel_x_r = sim * f['retrievability']
-        final_rank = 0.75 * rel_x_r + 0.25 * f['trust_score']
         results.append({
             **f,
             'vector_similarity': round(sim, 4),
             'relevance_x_retrievability': round(rel_x_r, 4),
-            'final_rank_score': round(final_rank, 4),
+            'final_rank_score': round(0.75 * rel_x_r + 0.25 * f['trust_score'], 4),
         })
     results.sort(key=lambda x: -x['final_rank_score'])
     return {
@@ -473,7 +465,6 @@ def limbic_recall_test(query: str, limit: int = 8, user_id: str = 'anthony') -> 
         'execution_ms': int((time.time() - t0) * 1000),
         'results': results[:limit],
     }
-
 
 # ── 3. CM (CASS MEMORY SYSTEM — Playbooks, Starters, Scoring & Context) ──────
 
