@@ -230,7 +230,7 @@ function graphStoreOf(n) {
   return n.kind;
 }
 
-function MemoryGraph3D({ graph }) {
+function MemoryGraph3D({ graph, onDelete }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
   const simRef = useRef({ pos: {}, vel: {}, alpha: 1, proj: [] });
@@ -242,6 +242,8 @@ function MemoryGraph3D({ graph }) {
   const [hover, setHover] = useState(null);
   const [query, setQuery] = useState('');
   const [autoRotate, setAutoRotate] = useState(true);
+  const [armed, setArmed] = useState(null);
+  const [busy, setBusy] = useState(false);
 
   const nodes = (graph && graph.nodes) || [];
   const edges = (graph && graph.edges) || [];
@@ -651,7 +653,16 @@ function MemoryGraph3D({ graph }) {
                 h('span', { style: S.pill(GRAPH_NODE_COLORS[selNode.noise ? 'noise' : selNode.kind]) }, GRAPH_NODE_LABELS[selNode.kind]),
                 selNode.meta && selNode.meta.store && h('span', { style: S.pill('#60a5fa') }, selNode.meta.store),
                 selNode.meta && selNode.meta.type && h('span', { style: S.pill('#a78bfa') }, selNode.meta.type),
-                h('button', { style: { ...S.btn('default'), marginLeft: 'auto' }, onClick: () => setSelected(null) }, 'Clear')),
+                h('button', { style: { ...S.btn('default'), marginLeft: 'auto' }, onClick: () => setSelected(null), title: 'Deselect (Esc) — does not delete' }, 'Deselect')),
+              onDelete && selNode.kind !== 'entity' && h('div', { style: { marginBottom: 10 } },
+                h('button', {
+                  style: S.btn(armed === selNode.id ? 'danger' : 'warn'), disabled: busy,
+                  onClick: async () => {
+                    if (armed !== selNode.id) { setArmed(selNode.id); setTimeout(() => setArmed((a) => (a === selNode.id ? null : a)), 4000); return; }
+                    setBusy(true);
+                    try { await onDelete(selNode); setSelected(null); } finally { setBusy(false); setArmed(null); }
+                  },
+                }, busy ? 'Deleting…' : armed === selNode.id ? 'Click again to confirm' : 'Delete from ' + (selNode.kind === 'fact' ? 'limbic' : selNode.kind === 'cm' ? 'cm playbook' : (selNode.meta && selNode.meta.store) || 'built-in'))),
               h('div', { style: { fontSize: 13, lineHeight: 1.5, marginBottom: 10, whiteSpace: 'pre-wrap', wordBreak: 'break-word' } }, selNode.text),
               selNode.meta && h('div', { style: { ...S.mono, marginBottom: 12, lineHeight: 1.6, color: 'var(--muted-foreground, #9ca3af)' } },
                 Object.entries(selNode.meta).filter(([, val]) => val !== null && val !== undefined && val !== '').map(([k, val]) => h('div', { key: k }, k + ': ' + val))),
@@ -863,6 +874,23 @@ function MemoryStudioPage({ api }) {
       });
       setSnap((prev) => prev ? { ...prev, limbic: updated } : prev);
       notify('Applied Limbic signal: ' + signal);
+    } catch (e) {
+      notify('Error: ' + e.message);
+    }
+  };
+
+  const handleGraphDelete = async (node) => {
+    const m = node.meta || {};
+    let path = null;
+    let body = null;
+    if (node.kind === 'fact') { path = '/limbic/forget'; body = { fact_id: m.fact_id }; }
+    else if (node.kind === 'builtin') { path = '/builtin/update'; body = { target: node.id.split(':')[0], action: 'remove', content: node.text }; }
+    else if (node.kind === 'cm') { path = '/cm/remove'; body = { bullet_id: m.bullet_id }; }
+    if (!path) return;
+    try {
+      await callApi(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      notify('Deleted: ' + (node.label || '').slice(0, 50));
+      await loadSnapshot();
     } catch (e) {
       notify('Error: ' + e.message);
     }
@@ -1466,7 +1494,7 @@ function MemoryStudioPage({ api }) {
     ),
 
     // TAB: 3D MEMORY GRAPH
-    tab === 'graph' && h(MemoryGraph3D, { graph: snap && snap.graph }),
+    tab === 'graph' && h(MemoryGraph3D, { graph: snap && snap.graph, onDelete: handleGraphDelete }),
 
     // TAB 4: CM PLAYBOOKS & STARTERS
     tab === 'cm' && h('div', null,

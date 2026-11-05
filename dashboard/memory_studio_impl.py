@@ -395,20 +395,28 @@ def limbic_feedback(fact_id: int, signal: str) -> Dict[str, Any]:
 
 
 def limbic_forget(fact_id: int) -> Dict[str, Any]:
+    """Delete one limbic fact the way limbic's own SQLiteStore.delete_fact does.
+
+    The facts_ad trigger keeps the external-content FTS index in sync, so FTS rows are
+    never touched by hand (a manual DELETE on facts_fts corrupts it). vec_index has no
+    FK and is cleaned explicitly; mentions are removed and entities left with no
+    mentions are pruned so the entity graph doesn't keep ghost nodes.
+    """
     fid = int(fact_id)
     con = _connect_limbic()
     try:
+        con.execute('BEGIN IMMEDIATE')
         con.execute('DELETE FROM mentions WHERE fact_id = ?', (fid,))
-        try:
-            con.execute('DELETE FROM vec_index WHERE rowid = ?', (fid,))
-        except Exception:
-            pass
-        try:
-            con.execute('DELETE FROM facts_fts WHERE rowid = ?', (fid,))
-        except Exception:
-            pass
-        con.execute('DELETE FROM facts WHERE fact_id = ?', (fid,))
+        con.execute('DELETE FROM contradictions WHERE newer_fact_id = ? OR older_fact_id = ?', (fid, fid))
+        cur = con.execute('DELETE FROM facts WHERE fact_id = ?', (fid,))
+        con.execute('DELETE FROM vec_index WHERE rowid = ?', (fid,))
+        con.execute('DELETE FROM entities WHERE entity_id NOT IN (SELECT DISTINCT entity_id FROM mentions)')
         con.commit()
+        if cur.rowcount == 0:
+            raise ValueError(f'limbic fact #{fid} not found')
+    except Exception:
+        con.rollback()
+        raise
     finally:
         con.close()
     return get_limbic_payload()
