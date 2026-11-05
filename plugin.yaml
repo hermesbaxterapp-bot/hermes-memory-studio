@@ -1,0 +1,16 @@
+manifest_version: 2
+api_version: 1
+name: memory-studio
+label: Memory Studio
+version: 0.1.0
+description: "Unified observability & control for Hermes Built-in Memory (MEMORY.md & USER.md), Limbic (FSRS-4.5 retention, trust gating, entity graph), Cass Memory (CM playbooks, confidence decay, anti-patterns, starters), and CASS Cross-Agent Session Search."
+author: hermesbaxterapp-bot
+kind: standalone
+license: MIT
+requires_hermes: ">=0.21.5"
+tags:
+  - desktop
+  - memory
+  - limbic
+  - cass
+  - observability
