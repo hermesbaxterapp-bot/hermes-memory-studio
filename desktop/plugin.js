@@ -1180,8 +1180,8 @@ function MemoryStudioPage({ api }) {
             const pct = Math.min(100, Math.round(((ag.messages || 0) / Math.max(1, cass.messages || 1)) * 100));
             return h('div', { key: ag.agent, style: { marginBottom: 8 } },
               h('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 3 } },
-                h('span', { style: { fontWeight: 600 } }, ag.agent + (ag.agent === 'codex' ? ' (includes Hermes Bridged)' : '')),
-                h('span', { style: S.mono }, ag.conversations + ' convs · ' + (ag.messages || 0).toLocaleString() + ' msgs (' + pct + '%)')
+                h('span', { style: { fontWeight: 600 } }, ag.agent),
+                h('span', { style: S.mono }, (ag.conversations || 0).toLocaleString() + ' convs · ' + (ag.messages || 0).toLocaleString() + ' msgs (' + pct + '% of msgs)')
               ),
               h('div', { style: S.barOuter },
                 h('div', { style: { height: '100%', width: Math.max(3, pct) + '%', background: '#3b82f6' } })
@@ -1200,7 +1200,7 @@ function MemoryStudioPage({ api }) {
             (cass.top_workspaces || []).map((w, i) =>
               h('div', { key: i, style: { display: 'flex', justifyContent: 'space-between', fontSize: 11.5, padding: '3px 0', borderBottom: '1px solid rgba(255,255,255,0.05)' } },
                 h('span', { style: { ...S.mono, cursor: 'pointer', color: '#93c5fd' }, onClick: () => setCassWs(w.workspace) }, w.workspace),
-                h('span', { style: S.mono }, w.conversations + ' convs')
+                h('span', { style: S.mono }, (w.conversations || 0) + ' convs · ' + (w.messages || 0).toLocaleString() + ' msgs')
               )
             )
           )

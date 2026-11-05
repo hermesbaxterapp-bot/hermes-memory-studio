@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import math
+import logging
 import sqlite3
 import subprocess
 import sys
@@ -14,6 +15,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 HERMES_HOME = Path('C:/Users/danci/AppData/Local/hermes')
 CM_DIR = Path('C:/Users/danci/.cass-memory')
@@ -839,13 +842,34 @@ def get_cass_payload(force_refresh: bool = False) -> Dict[str, Any]:
         except Exception:
             pass
 
+    # cass stats gives conversation `count` only; add per-agent / per-workspace message counts from its db.
+    db_path = stats_res.get('db_path') or 'C:/Users/danci/AppData/Roaming/coding-agent-search/coding-agent-search/data/agent_search.db'
+    agent_msgs: Dict[str, int] = {}
+    ws_msgs: Dict[str, int] = {}
+    try:
+        with sqlite3.connect(f'file:{Path(db_path).as_posix()}?mode=ro', uri=True, timeout=5) as con:
+            for slug, n in con.execute('SELECT a.slug, COUNT(m.id) FROM messages m JOIN conversations c ON c.id = m.conversation_id JOIN agents a ON a.id = c.agent_id GROUP BY a.slug'):
+                agent_msgs[slug] = int(n)
+            for wpath, n in con.execute('SELECT w.path, COUNT(m.id) FROM messages m JOIN conversations c ON c.id = m.conversation_id JOIN workspaces w ON w.id = c.workspace_id GROUP BY w.path'):
+                ws_msgs[wpath] = int(n)
+    except sqlite3.Error as exc:
+        logger.warning('memory-studio: cass per-agent message counts unavailable: %s', exc)
+    by_agent = [
+        {'agent': a.get('agent'), 'conversations': int(a.get('count') or 0), 'messages': agent_msgs.get(a.get('agent'), 0)}
+        for a in by_agent
+    ]
+    top_workspaces = [
+        {'workspace': w.get('workspace'), 'conversations': int(w.get('count') or 0), 'messages': ws_msgs.get(w.get('workspace'), 0)}
+        for w in (stats_res.get('top_workspaces') or [])[:12]
+    ]
+
     payload = {
         'healthy': bool(health_res.get('healthy', True)),
         'latency_ms': health_res.get('latency_ms', 0),
         'conversations': int(stats_res.get('conversations') or 0),
         'messages': int(stats_res.get('messages') or 0),
         'by_agent': by_agent,
-        'top_workspaces': (stats_res.get('top_workspaces') or [])[:12],
+        'top_workspaces': top_workspaces,
         'date_range': stats_res.get('date_range') or {},
         'db_path': stats_res.get('db_path', 'C:/Users/danci/AppData/Roaming/coding-agent-search/coding-agent-search/data/agent_search.db'),
         'hermes_bridge': {
