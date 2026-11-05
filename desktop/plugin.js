@@ -1,7 +1,7 @@
 // Memory Studio - Unified Observability & Control for Hermes Built-in Memory,
 // Limbic (FSRS-4.5 + Trust + Entity Graph), CM Playbooks & Starters, and CASS Session Search.
 
-import { createElement as h, useState, useEffect, useCallback } from 'react';
+import { createElement as h, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { host, PALETTE_AREA, ROUTES_AREA, SIDEBAR_NAV_AREA } from '@hermes/plugin-sdk';
 
 const API_BASE = '/api/plugins/memory-studio';
@@ -208,6 +208,487 @@ const TIER_COLORS = {
   candidate: '#a855f7',
   deprecated: '#ef4444',
 };
+
+// ── 3D Memory Graph ─────────────────────────────────────────────────────────
+// Canvas-only (no deps): 3D force layout + perspective camera you can fly.
+// Drag = orbit · Shift/right-drag = pan · Wheel = zoom · WASD/QE = fly · Click = focus · R = reset · Space = auto-rotate
+
+const GRAPH_NODE_COLORS = { fact: '#34d399', builtin: '#60a5fa', cm: '#f59e0b', entity: '#a78bfa', noise: '#6b7280' };
+const GRAPH_NODE_LABELS = { fact: 'Limbic fact', builtin: 'Built-in memory', cm: 'cm playbook rule', entity: 'Limbic entity' };
+const GRAPH_EDGE_RGB = { mention: [167, 139, 250], names: [96, 165, 250], similar: [52, 211, 153], dup: [248, 113, 113] };
+const GRAPH_EDGE_LABELS = {
+  mention: 'mentions (limbic NER, stored)',
+  names: 'names entity (text match, derived)',
+  similar: 'semantically similar (Arctic Embed cosine, derived)',
+  dup: 'near-duplicate across stores (cos >= 0.85)',
+};
+const DUP_THRESHOLD = 0.85;
+
+function graphStoreOf(n) {
+  if (!n) return '';
+  if (n.kind === 'builtin') return (n.meta && n.meta.store) || 'builtin';
+  return n.kind;
+}
+
+function MemoryGraph3D({ graph }) {
+  const wrapRef = useRef(null);
+  const canvasRef = useRef(null);
+  const simRef = useRef({ pos: {}, vel: {}, alpha: 1, proj: [] });
+  const camRef = useRef({ yaw: 0.7, pitch: 0.28, dist: 620, target: [0, 0, 0], goal: null, goalDist: null, keys: {} });
+  const dragRef = useRef(null);
+  const [show, setShow] = useState({ fact: true, builtin: true, cm: true, entity: true, noise: false, mention: true, names: true, similar: true });
+  const [minSim, setMinSim] = useState(0.45);
+  const [selected, setSelected] = useState(null);
+  const [hover, setHover] = useState(null);
+  const [query, setQuery] = useState('');
+  const [autoRotate, setAutoRotate] = useState(true);
+
+  const nodes = (graph && graph.nodes) || [];
+  const edges = (graph && graph.edges) || [];
+  const byId = useMemo(() => {
+    const m = {};
+    nodes.forEach((n) => { m[n.id] = n; });
+    return m;
+  }, [graph]);
+
+  // Visible subgraph for the current filters.
+  const view = useMemo(() => {
+    const nodeOk = (n) => n && show[n.kind] && !(n.kind === 'entity' && n.noise && !show.noise);
+    const vEdges = edges.filter((e) => {
+      if (!show[e.kind]) return false;
+      if (e.kind === 'similar' && e.w < minSim) return false;
+      return nodeOk(byId[e.s]) && nodeOk(byId[e.t]);
+    }).map((e) => {
+      const dup = e.kind === 'similar' && e.w >= DUP_THRESHOLD && graphStoreOf(byId[e.s]) !== graphStoreOf(byId[e.t]);
+      return { ...e, dup };
+    });
+    const linked = new Set();
+    vEdges.forEach((e) => { linked.add(e.s); linked.add(e.t); });
+    const vNodes = nodes.filter((n) => nodeOk(n) && (n.kind !== 'entity' || linked.has(n.id)));
+    const adj = {};
+    vEdges.forEach((e) => {
+      (adj[e.s] = adj[e.s] || []).push({ id: e.t, e });
+      (adj[e.t] = adj[e.t] || []).push({ id: e.s, e });
+    });
+    return { nodes: vNodes, edges: vEdges, adj };
+  }, [graph, show, minSim]);
+
+  const matches = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return new Set();
+    return new Set(view.nodes.filter((n) => (n.text || '').toLowerCase().includes(q)).map((n) => n.id));
+  }, [view, query]);
+
+  const dups = useMemo(() => view.edges.filter((e) => e.dup).sort((a, b) => b.w - a.w), [view]);
+
+  // Live values for the animation loop without restarting it.
+  const live = useRef({});
+  live.current = { view, selected, hover, matches, autoRotate, byId };
+
+  // Seed positions for new nodes, reheat on filter change.
+  useEffect(() => {
+    const sim = simRef.current;
+    view.nodes.forEach((n) => {
+      if (!sim.pos[n.id]) {
+        const nb = (view.adj[n.id] || []).map((x) => sim.pos[x.id]).find(Boolean);
+        const r = nb ? 30 : 260;
+        const base = nb || [0, 0, 0];
+        sim.pos[n.id] = [base[0] + (Math.random() - 0.5) * r, base[1] + (Math.random() - 0.5) * r, base[2] + (Math.random() - 0.5) * r];
+        sim.vel[n.id] = [0, 0, 0];
+      }
+    });
+    sim.alpha = Math.max(sim.alpha, 0.6);
+  }, [view]);
+
+  const flyTo = useCallback((id, dist) => {
+    const p = simRef.current.pos[id];
+    if (!p) return;
+    const cam = camRef.current;
+    cam.goal = p.slice();
+    cam.goalDist = dist || 170;
+  }, []);
+
+  const selectNode = useCallback((id) => {
+    setSelected(id);
+    if (id) { setAutoRotate(false); flyTo(id); }
+  }, [flyTo]);
+
+  const resetView = useCallback(() => {
+    const cam = camRef.current;
+    cam.goal = [0, 0, 0];
+    cam.goalDist = 620;
+    setSelected(null);
+  }, []);
+
+  // Main loop: physics + render.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const wrap = wrapRef.current;
+    if (!canvas || !wrap) return undefined;
+    const ctx2d = canvas.getContext('2d');
+    let raf = 0;
+    let stopped = false;
+
+    const tick = () => {
+      if (stopped) return;
+      const { view: v, selected: sel, hover: hov, matches: mt, autoRotate: rot } = live.current;
+      const sim = simRef.current;
+      const cam = camRef.current;
+
+      // ---- physics
+      if (sim.alpha > 0.004) {
+        const a = sim.alpha;
+        const ns = v.nodes;
+        const P = sim.pos;
+        const F = {};
+        ns.forEach((n) => { F[n.id] = [0, 0, 0]; });
+        for (let i = 0; i < ns.length; i++) {
+          const pi = P[ns[i].id];
+          const fi = F[ns[i].id];
+          for (let j = i + 1; j < ns.length; j++) {
+            const pj = P[ns[j].id];
+            const dx = pi[0] - pj[0], dy = pi[1] - pj[1], dz = pi[2] - pj[2];
+            const d2 = Math.max(dx * dx + dy * dy + dz * dz, 36);
+            const d = Math.sqrt(d2);
+            const f = 2600 / d2;
+            const fx = (dx / d) * f, fy = (dy / d) * f, fz = (dz / d) * f;
+            const fj = F[ns[j].id];
+            fi[0] += fx; fi[1] += fy; fi[2] += fz;
+            fj[0] -= fx; fj[1] -= fy; fj[2] -= fz;
+          }
+        }
+        v.edges.forEach((e) => {
+          const ps = P[e.s], pt = P[e.t];
+          if (!ps || !pt || !F[e.s] || !F[e.t]) return;
+          const rest = e.kind === 'mention' ? 34 : e.kind === 'names' ? 70 : 40 + 160 * (1 - e.w);
+          const k = e.kind === 'similar' ? 0.06 * e.w : 0.08;
+          const dx = pt[0] - ps[0], dy = pt[1] - ps[1], dz = pt[2] - ps[2];
+          const d = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+          const f = (d - rest) * k;
+          const fx = (dx / d) * f, fy = (dy / d) * f, fz = (dz / d) * f;
+          F[e.s][0] += fx; F[e.s][1] += fy; F[e.s][2] += fz;
+          F[e.t][0] -= fx; F[e.t][1] -= fy; F[e.t][2] -= fz;
+        });
+        ns.forEach((n) => {
+          const p = P[n.id], vel = sim.vel[n.id], f = F[n.id];
+          for (let c = 0; c < 3; c++) {
+            vel[c] = (vel[c] + (f[c] - p[c] * 0.004) * a) * 0.62;
+            p[c] += Math.max(-25, Math.min(25, vel[c]));
+          }
+        });
+        sim.alpha *= 0.992;
+      }
+
+      // ---- camera
+      const keys = cam.keys;
+      if (cam.goal) {
+        for (let c = 0; c < 3; c++) cam.target[c] += (cam.goal[c] - cam.target[c]) * 0.08;
+        if (cam.goalDist) cam.dist += (cam.goalDist - cam.dist) * 0.08;
+        const off = Math.abs(cam.goal[0] - cam.target[0]) + Math.abs(cam.goal[1] - cam.target[1]) + Math.abs(cam.goal[2] - cam.target[2]);
+        if (off < 0.5 && (!cam.goalDist || Math.abs(cam.goalDist - cam.dist) < 1)) { cam.goal = null; cam.goalDist = null; }
+      }
+      if (rot && !dragRef.current) cam.yaw += 0.0016;
+      const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+      const dir = [cp * Math.sin(cam.yaw), sp, cp * Math.cos(cam.yaw)]; // target -> camera
+      const eye = [cam.target[0] + dir[0] * cam.dist, cam.target[1] + dir[1] * cam.dist, cam.target[2] + dir[2] * cam.dist];
+      const fwd = [-dir[0], -dir[1], -dir[2]];
+      let right = [fwd[2], 0, -fwd[0]];
+      const rl = Math.hypot(right[0], right[2]) || 1;
+      right = [right[0] / rl, 0, right[2] / rl];
+      const up = [right[1] * fwd[2] - right[2] * fwd[1], right[2] * fwd[0] - right[0] * fwd[2], right[0] * fwd[1] - right[1] * fwd[0]];
+      const speed = cam.dist * 0.014;
+      const mv = (vec, s) => { for (let c = 0; c < 3; c++) cam.target[c] += vec[c] * s; cam.goal = null; };
+      if (keys.w) mv(fwd, speed);
+      if (keys.s) mv(fwd, -speed);
+      if (keys.a) mv(right, speed);
+      if (keys.d) mv(right, -speed);
+      if (keys.e) mv([0, 1, 0], speed);
+      if (keys.q) mv([0, 1, 0], -speed);
+
+      // ---- render
+      const dpr = window.devicePixelRatio || 1;
+      const W = wrap.clientWidth, H = wrap.clientHeight;
+      if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
+        canvas.width = Math.round(W * dpr);
+        canvas.height = Math.round(H * dpr);
+      }
+      ctx2d.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx2d.clearRect(0, 0, W, H);
+      const fl = H * 0.95;
+      const cx = W / 2, cy = H / 2;
+      const proj = {};
+      v.nodes.forEach((n) => {
+        const p = sim.pos[n.id];
+        if (!p) return;
+        const rx = p[0] - eye[0], ry = p[1] - eye[1], rz = p[2] - eye[2];
+        const z = rx * fwd[0] + ry * fwd[1] + rz * fwd[2];
+        if (z < 4) return;
+        const x = rx * right[0] + ry * right[1] + rz * right[2];
+        const y = rx * up[0] + ry * up[1] + rz * up[2];
+        const sc = fl / z;
+        proj[n.id] = { sx: cx - x * sc, sy: cy - y * sc, z, sc };
+      });
+
+      const focus = sel || hov;
+      const nbrs = new Set();
+      if (focus) {
+        nbrs.add(focus);
+        (v.adj[focus] || []).forEach((x) => nbrs.add(x.id));
+      }
+      const fogNear = cam.dist * 0.4, fogFar = cam.dist * 2.2;
+      const fog = (z) => Math.max(0.12, Math.min(1, 1 - (z - fogNear) / (fogFar - fogNear)));
+
+      ctx2d.lineCap = 'round';
+      v.edges.forEach((e) => {
+        const a = proj[e.s], b = proj[e.t];
+        if (!a || !b) return;
+        const hot = focus && (e.s === focus || e.t === focus);
+        const rgb = GRAPH_EDGE_RGB[e.dup ? 'dup' : e.kind];
+        let alpha = (e.kind === 'similar' ? 0.15 + 0.55 * (e.w - 0.3) : 0.32) * fog((a.z + b.z) / 2);
+        if (e.dup) alpha = Math.max(alpha, 0.55);
+        if (focus) alpha = hot ? 0.95 : alpha * 0.18;
+        ctx2d.strokeStyle = 'rgba(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ',' + alpha.toFixed(3) + ')';
+        ctx2d.lineWidth = hot ? 2 : e.dup ? 1.6 : 1;
+        ctx2d.beginPath();
+        ctx2d.moveTo(a.sx, a.sy);
+        ctx2d.lineTo(b.sx, b.sy);
+        ctx2d.stroke();
+      });
+
+      const order = v.nodes.filter((n) => proj[n.id]).sort((a, b) => proj[b.id].z - proj[a.id].z);
+      const pick = [];
+      // Unfocused: label only the ~12 nearest/biggest text nodes so the view stays readable.
+      const autoLabel = new Set();
+      if (!focus) {
+        order.filter((n) => n.kind !== 'entity').map((n) => [n.id, proj[n.id].sc * (4 + 6 * (n.weight || 0.5))])
+          .filter((x) => x[1] > 9).sort((a, b) => b[1] - a[1]).slice(0, 12).forEach((x) => autoLabel.add(x[0]));
+      }
+      const textColor = getComputedStyle(canvas).color || '#e5e7eb';
+      ctx2d.font = '11px ' + (getComputedStyle(canvas).fontFamily || 'sans-serif');
+      ctx2d.textBaseline = 'middle';
+      order.forEach((n) => {
+        const pr = proj[n.id];
+        const baseR = n.kind === 'entity' ? 2.2 + 2.2 * (n.weight || 0.5) : 4 + 6 * (n.weight || 0.5);
+        const r = Math.max(1.5, Math.min(40, baseR * pr.sc));
+        const col = n.kind === 'entity' && n.noise ? GRAPH_NODE_COLORS.noise : GRAPH_NODE_COLORS[n.kind];
+        let alpha = fog(pr.z);
+        if (focus && !nbrs.has(n.id)) alpha *= 0.22;
+        if (mt.size && !mt.has(n.id)) alpha *= 0.3;
+        ctx2d.globalAlpha = alpha;
+        if (n.kind !== 'entity') {
+          const g = ctx2d.createRadialGradient(pr.sx, pr.sy, r * 0.2, pr.sx, pr.sy, r * 2.4);
+          g.addColorStop(0, col + '66');
+          g.addColorStop(1, col + '00');
+          ctx2d.fillStyle = g;
+          ctx2d.beginPath();
+          ctx2d.arc(pr.sx, pr.sy, r * 2.4, 0, Math.PI * 2);
+          ctx2d.fill();
+        }
+        ctx2d.fillStyle = col;
+        ctx2d.beginPath();
+        ctx2d.arc(pr.sx, pr.sy, r, 0, Math.PI * 2);
+        ctx2d.fill();
+        if (n.id === sel || mt.has(n.id)) {
+          ctx2d.strokeStyle = n.id === sel ? '#ffffff' : '#fde047';
+          ctx2d.lineWidth = 2;
+          ctx2d.beginPath();
+          ctx2d.arc(pr.sx, pr.sy, r + 3, 0, Math.PI * 2);
+          ctx2d.stroke();
+        }
+        const showLabel = n.id === focus || (focus && nbrs.has(n.id)) || mt.has(n.id) || autoLabel.has(n.id);
+        if (showLabel) {
+          const lbl = (n.label || '').length > 46 ? n.label.slice(0, 45) + '…' : n.label;
+          ctx2d.globalAlpha = Math.min(1, alpha + 0.25);
+          ctx2d.fillStyle = textColor;
+          ctx2d.fillText(lbl, pr.sx + r + 4, pr.sy);
+        }
+        ctx2d.globalAlpha = 1;
+        pick.push({ id: n.id, sx: pr.sx, sy: pr.sy, r: Math.max(r, 5) });
+      });
+      sim.proj = pick;
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => { stopped = true; cancelAnimationFrame(raf); };
+  }, []);
+
+  // Input: wheel needs a non-passive listener; keys only while the canvas has focus.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return undefined;
+    const onWheel = (ev) => {
+      ev.preventDefault();
+      const cam = camRef.current;
+      cam.goalDist = null;
+      cam.dist = Math.max(25, Math.min(4000, cam.dist * Math.exp(ev.deltaY * 0.0012)));
+    };
+    const keyName = (ev) => (ev.key || '').toLowerCase();
+    const onKeyDown = (ev) => {
+      const k = keyName(ev);
+      if ('wasdqe'.includes(k) && k.length === 1) { camRef.current.keys[k] = true; setAutoRotate(false); ev.preventDefault(); }
+      if (k === ' ') { setAutoRotate((x) => !x); ev.preventDefault(); }
+      if (k === 'r') resetView();
+      if (k === 'escape') setSelected(null);
+    };
+    const onKeyUp = (ev) => { camRef.current.keys[keyName(ev)] = false; };
+    const onBlur = () => { camRef.current.keys = {}; };
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    canvas.addEventListener('keydown', onKeyDown);
+    canvas.addEventListener('keyup', onKeyUp);
+    canvas.addEventListener('blur', onBlur);
+    return () => {
+      canvas.removeEventListener('wheel', onWheel);
+      canvas.removeEventListener('keydown', onKeyDown);
+      canvas.removeEventListener('keyup', onKeyUp);
+      canvas.removeEventListener('blur', onBlur);
+    };
+  }, [resetView]);
+
+  const pickAt = (ev) => {
+    const rect = canvasRef.current.getBoundingClientRect();
+    const x = ev.clientX - rect.left, y = ev.clientY - rect.top;
+    let best = null, bestD = Infinity;
+    const list = simRef.current.proj || [];
+    for (let i = list.length - 1; i >= 0; i--) {
+      const p = list[i];
+      const d = Math.hypot(p.sx - x, p.sy - y);
+      if (d <= p.r + 3 && d < bestD) { best = p.id; bestD = d; }
+    }
+    return best;
+  };
+
+  const onMouseDown = (ev) => {
+    canvasRef.current.focus();
+    dragRef.current = { x: ev.clientX, y: ev.clientY, moved: 0, pan: ev.button === 2 || ev.shiftKey };
+  };
+  const onMouseMove = (ev) => {
+    const d = dragRef.current;
+    const cam = camRef.current;
+    if (d) {
+      const dx = ev.clientX - d.x, dy = ev.clientY - d.y;
+      d.x = ev.clientX; d.y = ev.clientY;
+      d.moved += Math.abs(dx) + Math.abs(dy);
+      if (d.moved > 4) setAutoRotate(false);
+      if (d.pan) {
+        const s = cam.dist / ((canvasRef.current.clientHeight || 600) * 0.95);
+        const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+        cam.target[0] += cy * dx * s; cam.target[2] -= sy * dx * s;
+        cam.target[1] += dy * s;
+        cam.goal = null;
+      } else {
+        cam.yaw -= dx * 0.006;
+        cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch + dy * 0.006));
+      }
+      return;
+    }
+    const id = pickAt(ev);
+    if (id !== live.current.hover) setHover(id);
+  };
+  const onMouseUp = (ev) => {
+    const d = dragRef.current;
+    dragRef.current = null;
+    if (d && d.moved < 5 && ev.button === 0) {
+      const id = pickAt(ev);
+      if (id) selectNode(id); else setSelected(null);
+    }
+  };
+
+  const selNode = selected ? byId[selected] : null;
+  const selNbrs = selected ? (view.adj[selected] || []).slice().sort((a, b) => b.e.w - a.e.w) : [];
+  const stats = (graph && graph.stats) || {};
+  const check = (key, label, color) => h('label', { key, style: { display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, cursor: 'pointer' } },
+    h('input', { type: 'checkbox', checked: !!show[key], onChange: (e) => setShow({ ...show, [key]: e.target.checked }) }),
+    color && h('span', { style: { width: 9, height: 9, borderRadius: 99, background: color, display: 'inline-block' } }),
+    label);
+
+  if (!nodes.length) {
+    return h('div', { style: S.card }, (graph && graph.error) ? 'Graph build failed: ' + graph.error : 'No graph data yet — refresh the snapshot.');
+  }
+
+  return h('div', null,
+    h('div', { style: { ...S.card, marginBottom: 12, display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'center' } },
+      check('fact', 'Limbic facts', GRAPH_NODE_COLORS.fact),
+      check('builtin', 'Built-in', GRAPH_NODE_COLORS.builtin),
+      check('cm', 'cm rules', GRAPH_NODE_COLORS.cm),
+      check('entity', 'Entities', GRAPH_NODE_COLORS.entity),
+      check('noise', 'numbers/dates (' + (stats.noise_entities || 0) + ')', GRAPH_NODE_COLORS.noise),
+      h('span', { style: { width: 1, height: 18, background: 'var(--border, rgba(255,255,255,0.1))' } }),
+      check('mention', 'mentions'),
+      check('names', 'names'),
+      check('similar', 'similar'),
+      h('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12 } },
+        'min cos ' + minSim.toFixed(2),
+        h('input', { type: 'range', min: 0.3, max: 0.95, step: 0.01, value: minSim, onChange: (e) => setMinSim(Number(e.target.value)) })),
+      h('input', {
+        style: { ...S.input, width: 200 }, value: query, placeholder: 'Find node… (Enter flies to it)',
+        onChange: (e) => setQuery(e.target.value),
+        onKeyDown: (e) => { if (e.key === 'Enter' && matches.size) selectNode(Array.from(matches)[0]); },
+      }),
+      h('button', { style: S.btn(autoRotate ? 'success' : 'default'), onClick: () => setAutoRotate(!autoRotate) }, autoRotate ? 'Auto-rotate on' : 'Auto-rotate off'),
+      h('button', { style: S.btn('default'), onClick: resetView }, 'Reset view')
+    ),
+    h('div', { style: { display: 'flex', gap: 12, alignItems: 'stretch' } },
+      h('div', { ref: wrapRef, style: { flex: 1, minWidth: 0, height: 660, position: 'relative', borderRadius: 10, overflow: 'hidden', border: '1px solid var(--border, rgba(255,255,255,0.08))', background: 'radial-gradient(ellipse at center, rgba(96,165,250,0.06), rgba(0,0,0,0) 70%)' } },
+        h('canvas', {
+          ref: canvasRef, tabIndex: 0,
+          style: { width: '100%', height: '100%', display: 'block', outline: 'none', cursor: hover ? 'pointer' : 'grab', color: 'var(--foreground, #e5e7eb)' },
+          onMouseDown, onMouseMove, onMouseUp,
+          onMouseLeave: () => { dragRef.current = null; setHover(null); },
+          onContextMenu: (e) => e.preventDefault(),
+        }),
+        h('div', { style: { position: 'absolute', left: 10, bottom: 8, fontSize: 11, color: 'var(--muted-foreground, #9ca3af)', pointerEvents: 'none', lineHeight: 1.5 } },
+          'Drag orbit · Shift/right-drag pan · Wheel zoom · click canvas then WASD fly, Q/E down/up · Click node to focus · R reset · Space rotate · Esc clear'),
+        h('div', { style: { position: 'absolute', left: 10, top: 8, fontSize: 11, color: 'var(--muted-foreground, #9ca3af)', pointerEvents: 'none', lineHeight: 1.6 } },
+          view.nodes.length + ' nodes · ' + view.edges.length + ' edges shown',
+          Object.keys(GRAPH_EDGE_LABELS).map((k) => h('div', { key: k, style: { display: 'flex', alignItems: 'center', gap: 6 } },
+            h('span', { style: { width: 16, height: 2, background: 'rgb(' + GRAPH_EDGE_RGB[k].join(',') + ')', display: 'inline-block' } }),
+            GRAPH_EDGE_LABELS[k])))
+      ),
+      h('div', { style: { ...S.card, width: 340, flexShrink: 0, height: 660, overflowY: 'auto', boxSizing: 'border-box' } },
+        selNode
+          ? h('div', null,
+              h('div', { style: { display: 'flex', gap: 6, alignItems: 'center', marginBottom: 8, flexWrap: 'wrap' } },
+                h('span', { style: S.pill(GRAPH_NODE_COLORS[selNode.noise ? 'noise' : selNode.kind]) }, GRAPH_NODE_LABELS[selNode.kind]),
+                selNode.meta && selNode.meta.store && h('span', { style: S.pill('#60a5fa') }, selNode.meta.store),
+                selNode.meta && selNode.meta.type && h('span', { style: S.pill('#a78bfa') }, selNode.meta.type),
+                h('button', { style: { ...S.btn('default'), marginLeft: 'auto' }, onClick: () => setSelected(null) }, 'Clear')),
+              h('div', { style: { fontSize: 13, lineHeight: 1.5, marginBottom: 10, whiteSpace: 'pre-wrap', wordBreak: 'break-word' } }, selNode.text),
+              selNode.meta && h('div', { style: { ...S.mono, marginBottom: 12, lineHeight: 1.6, color: 'var(--muted-foreground, #9ca3af)' } },
+                Object.entries(selNode.meta).filter(([, val]) => val !== null && val !== undefined && val !== '').map(([k, val]) => h('div', { key: k }, k + ': ' + val))),
+              h('div', { style: S.cardLabel }, 'Linked (' + selNbrs.length + ')'),
+              selNbrs.map(({ id, e }) => {
+                const n = byId[id];
+                if (!n) return null;
+                const tag = e.dup ? 'DUP ' + e.w.toFixed(2) : e.kind === 'similar' ? 'cos ' + e.w.toFixed(2) : e.kind;
+                return h('div', {
+                  key: id + e.kind, onClick: () => selectNode(id),
+                  style: { padding: '6px 0', borderBottom: '1px solid rgba(255,255,255,0.05)', cursor: 'pointer', fontSize: 12, display: 'flex', gap: 8, alignItems: 'baseline' },
+                },
+                  h('span', { style: { width: 8, height: 8, borderRadius: 99, flexShrink: 0, background: GRAPH_NODE_COLORS[n.noise ? 'noise' : n.kind], display: 'inline-block' } }),
+                  h('span', { style: { flex: 1, minWidth: 0 } }, n.label),
+                  h('span', { style: { ...S.mono, fontSize: 10.5, color: e.dup ? '#f87171' : 'var(--muted-foreground, #9ca3af)', flexShrink: 0 } }, tag));
+              }))
+          : h('div', null,
+              h('div', { style: S.cardLabel }, 'Graph'),
+              h('div', { style: { fontSize: 12.5, lineHeight: 1.6, marginBottom: 12 } },
+                (stats.nodes ? Object.entries(stats.nodes).map(([k, val]) => val + ' ' + k).join(' · ') : ''), h('br'),
+                (stats.edges ? Object.entries(stats.edges).map(([k, val]) => val + ' ' + k).join(' · ') : ''), h('br'),
+                'Entities shared by 2+ facts: ' + (stats.shared_entities || 0)),
+              h('div', { style: S.cardLabel }, 'Near-duplicates across stores (' + dups.length + ')'),
+              h('div', { style: { fontSize: 11.5, color: 'var(--muted-foreground, #9ca3af)', margin: '4px 0 8px' } },
+                'The same fact held in two stores costs tokens twice in every injected prompt.'),
+              dups.length === 0 && h('div', { style: { fontSize: 12 } }, 'None at the current filters.'),
+              dups.map((e) => h('div', {
+                key: e.s + e.t, onClick: () => selectNode(e.s),
+                style: { padding: '7px 0', borderBottom: '1px solid rgba(255,255,255,0.05)', cursor: 'pointer', fontSize: 11.5, lineHeight: 1.45 },
+              },
+                h('div', { style: { ...S.mono, color: '#f87171', fontSize: 10.5 } }, 'cos ' + e.w.toFixed(3) + ' · ' + graphStoreOf(byId[e.s]) + ' ↔ ' + graphStoreOf(byId[e.t])),
+                h('div', null, (byId[e.s] || {}).label),
+                h('div', { style: { color: 'var(--muted-foreground, #9ca3af)' } }, (byId[e.t] || {}).label))))
+      )
+    )
+  );
+}
 
 function MemoryStudioPage({ api }) {
 
@@ -634,6 +1115,7 @@ function MemoryStudioPage({ api }) {
         { id: 'overview', label: 'Unified Search & Overview', count: 'All 4' },
         { id: 'builtin', label: 'Built-in Memory', count: builtin.total_entries },
         { id: 'limbic', label: 'Limbic (FSRS + Entities)', count: limbic.total_facts },
+        { id: 'graph', label: 'Memory Graph (3D)', count: ((snap && snap.graph && snap.graph.nodes) || []).length },
         { id: 'cm', label: 'CM Playbooks & Starters', count: cm.total_bullets },
         { id: 'cass', label: 'CASS Session Search', count: cass.conversations },
       ].map((t) =>
@@ -889,7 +1371,10 @@ function MemoryStudioPage({ api }) {
       h('div', { style: { ...S.card, marginBottom: 16 } },
         h('div', { style: S.sectionTitle },
           h('span', null, 'Entity Graph Explorer (' + (limbic.entities || []).length + ' entities across ' + (limbic.total_mentions || 0) + ' mentions — click to filter facts)'),
-          lEntity && h('button', { style: S.btn('default'), onClick: () => setLEntity('') }, 'Clear Entity Filter: ' + lEntity)
+          h('div', { style: { display: 'flex', gap: 6 } },
+            lEntity && h('button', { style: S.btn('default'), onClick: () => setLEntity('') }, 'Clear Entity Filter: ' + lEntity),
+            h('button', { style: S.btn('success'), onClick: () => setTab('graph') }, 'Fly the 3D graph')
+          )
         ),
         h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap', maxHeight: 120, overflowY: 'auto' } },
           (limbic.entities || []).map((en) => {
@@ -979,6 +1464,9 @@ function MemoryStudioPage({ api }) {
         })()
       )
     ),
+
+    // TAB: 3D MEMORY GRAPH
+    tab === 'graph' && h(MemoryGraph3D, { graph: snap && snap.graph }),
 
     // TAB 4: CM PLAYBOOKS & STARTERS
     tab === 'cm' && h('div', null,

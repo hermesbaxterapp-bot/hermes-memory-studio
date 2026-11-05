@@ -298,11 +298,18 @@ def _get_limbic_embedder():
     global _EMBEDDER_INSTANCE
     with _EMBEDDER_LOCK:
         if _EMBEDDER_INSTANCE is None:
-            limbic_dir = str(HERMES_HOME / 'plugins' / 'limbic')
-            if limbic_dir not in sys.path:
-                sys.path.insert(0, limbic_dir)
-            from embeddings import LimbicEmbedder
-            _EMBEDDER_INSTANCE = LimbicEmbedder()
+            # LimbicEmbedder is the abstract base (embed() raises); OnnxEmbedder is the bundled
+            # Arctic Embed 2.0 L model limbic itself writes vec_index with. embeddings.py uses
+            # relative imports, so load it inside a bare package shell (skips limbic/__init__).
+            import importlib
+            import types
+            pkg_name = '_memory_studio_limbic'
+            if pkg_name not in sys.modules:
+                pkg = types.ModuleType(pkg_name)
+                pkg.__path__ = [str(HERMES_HOME / 'plugins' / 'limbic')]
+                sys.modules[pkg_name] = pkg
+            emb_mod = importlib.import_module(pkg_name + '.embeddings')
+            _EMBEDDER_INSTANCE = emb_mod.OnnxEmbedder()
         return _EMBEDDER_INSTANCE
 
 
@@ -964,12 +971,187 @@ def cass_sync_hermes() -> Dict[str, Any]:
 
 # ── 5. UNIFIED SNAPSHOT ──────────────────────────────────────────────────────
 
+
+# ── 5. UNIFIED MEMORY GRAPH (3D view) ────────────────────────────────────────
+#
+# Real edges: limbic `mentions` (fact -> entity, from limbic's NER pass).
+# Derived edges, labelled as such:
+#   * `similar`  - cosine similarity between texts, using limbic's own Arctic Embed
+#                  vectors (facts read straight from vec_index; built-in entries and
+#                  cm bullets embedded with the same model and cached on disk).
+#   * `names`    - a built-in entry or cm bullet whose text contains a limbic entity name.
+
+NOISE_ENTITY_TYPES = {'CARDINAL', 'DATE', 'TIME', 'MONEY', 'PERCENT', 'ORDINAL', 'QUANTITY'}
+_GRAPH_EMB_CACHE_PATH = HERMES_HOME / 'cache' / 'memory-studio' / 'embeddings.json'
+_GRAPH_EMB_CACHE: Dict[str, List[float]] = {}
+_GRAPH_SIM_FLOOR = 0.30
+_GRAPH_SIM_TOPK = 4
+
+
+def _load_emb_cache() -> None:
+    if _GRAPH_EMB_CACHE or not _GRAPH_EMB_CACHE_PATH.exists():
+        return
+    try:
+        _GRAPH_EMB_CACHE.update(json.loads(_GRAPH_EMB_CACHE_PATH.read_text(encoding='utf-8')))
+    except (OSError, ValueError) as exc:
+        logger.warning('memory-studio: embedding cache unreadable, rebuilding: %s', exc)
+
+
+def _embed_cached(texts: List[str]) -> List[Optional[List[float]]]:
+    import hashlib
+    _load_emb_cache()
+    keys = [hashlib.sha1(tx.encode('utf-8')).hexdigest() for tx in texts]
+    missing = [i for i, k in enumerate(keys) if k not in _GRAPH_EMB_CACHE]
+    if missing:
+        emb = _get_limbic_embedder()
+        for i in missing:
+            vec = emb.embed(texts[i])
+            if vec is not None:
+                _GRAPH_EMB_CACHE[keys[i]] = [round(float(x), 6) for x in vec]
+        _GRAPH_EMB_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        live = set(keys)
+        keep = {k: v for k, v in _GRAPH_EMB_CACHE.items() if k in live}
+        _GRAPH_EMB_CACHE_PATH.write_text(json.dumps(keep), encoding='utf-8')
+    return [_GRAPH_EMB_CACHE.get(k) for k in keys]
+
+
+def _cos(a: List[float], b: List[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a)) or 1.0
+    nb = math.sqrt(sum(y * y for y in b)) or 1.0
+    return dot / (na * nb)
+
+
+def get_memory_graph(builtin: Optional[Dict[str, Any]] = None, limbic: Optional[Dict[str, Any]] = None,
+                     cm: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    import re
+    t0 = time.time()
+    builtin = builtin or get_builtin_payload()
+    limbic = limbic or get_limbic_payload()
+    cm = cm or get_cm_payload()
+
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+    text_nodes: List[Dict[str, Any]] = []  # nodes that take part in similarity
+
+    for f in limbic.get('facts') or []:
+        n = {'id': f'fact:{f["fact_id"]}', 'kind': 'fact', 'label': f['content'][:70], 'text': f['content'],
+             'weight': f.get('composite_score', 0.5),
+             'meta': {'fact_id': f['fact_id'], 'trust': f.get('trust_score'), 'tier': f.get('trust_tier'),
+                      'retrievability_pct': f.get('retrievability_pct'), 'retrievals': f.get('retrieval_count')}}
+        nodes.append(n)
+        text_nodes.append(n)
+
+    for target in ('memory', 'user'):
+        for e in (builtin.get(target) or {}).get('entries') or []:
+            n = {'id': f'{target}:{e["index"]}', 'kind': 'builtin', 'label': e['content'][:70], 'text': e['content'],
+                 'weight': 0.6, 'meta': {'store': 'MEMORY.md' if target == 'memory' else 'USER.md', 'chars': e.get('chars')}}
+            nodes.append(n)
+            text_nodes.append(n)
+
+    for b in cm.get('bullets') or []:
+        if b.get('deprecated') or b.get('state') == 'retired':
+            continue
+        n = {'id': f'cm:{b["id"]}', 'kind': 'cm', 'label': b['content'][:70], 'text': b['content'],
+             'weight': max(0.2, min(1.0, float(b.get('effective_score') or 0.5))),
+             'meta': {'bullet_id': b['id'], 'category': b.get('category'), 'maturity': b.get('maturity'),
+                      'kind': b.get('kind'), 'effective_score': b.get('effective_score')}}
+        nodes.append(n)
+        text_nodes.append(n)
+
+    ent_name_by_id: Dict[str, Dict[str, Any]] = {}
+    for en in limbic.get('entities') or []:
+        noise = en.get('type') in NOISE_ENTITY_TYPES or bool(re.fullmatch(r'[\d\s.,:/-]+', en['name']))
+        ent_name_by_id[en['entity_id']] = en
+        nodes.append({'id': f'ent:{en["entity_id"]}', 'kind': 'entity', 'label': en['name'], 'text': en['name'],
+                      'weight': 0.3 + 0.2 * min(4, en.get('mention_count') or 1), 'noise': noise,
+                      'meta': {'type': en.get('type'), 'mentions': en.get('mention_count')}})
+        for fid in en.get('fact_ids') or []:
+            edges.append({'s': f'fact:{fid}', 't': f'ent:{en["entity_id"]}', 'kind': 'mention', 'w': 1.0})
+
+    # names: built-in / cm text containing a (non-noise) entity name
+    for n in text_nodes:
+        if n['kind'] == 'fact':
+            continue
+        low = n['text'].lower()
+        for eid, en in ent_name_by_id.items():
+            name = en['name'].strip()
+            if len(name) < 3 or en.get('type') in NOISE_ENTITY_TYPES or re.fullmatch(r'[\d\s.,:/-]+', name):
+                continue
+            if re.search(r'(?<![\w])' + re.escape(name.lower()) + r'(?![\w])', low):
+                edges.append({'s': n['id'], 't': f'ent:{eid}', 'kind': 'names', 'w': 0.8})
+
+    # similar: cosine over Arctic Embed vectors
+    vec_by_fact: Dict[int, List[float]] = {}
+    con = _connect_limbic()
+    try:
+        for rowid, vjson in con.execute('SELECT rowid, vec_to_json(embedding) FROM vec_index'):
+            vec_by_fact[int(rowid)] = json.loads(vjson)
+    except sqlite3.Error as exc:
+        logger.warning('memory-studio: limbic vectors unavailable (sqlite_vec not loaded?): %s', exc)
+    finally:
+        con.close()
+    others = [n for n in text_nodes if n['kind'] != 'fact']
+    other_vecs = _embed_cached([n['text'] for n in others]) if others else []
+    vecs: List[Optional[List[float]]] = []
+    for n in text_nodes:
+        if n['kind'] == 'fact':
+            vecs.append(vec_by_fact.get(n['meta']['fact_id']))
+    vecs.extend(other_vecs)
+    ordered = [n for n in text_nodes if n['kind'] == 'fact'] + others
+    seen = set()
+    sims_all: List[float] = []
+    for i, a in enumerate(ordered):
+        va = vecs[i]
+        if va is None:
+            continue
+        scored = []
+        for j, b in enumerate(ordered):
+            if i == j or vecs[j] is None:
+                continue
+            scored.append((_cos(va, vecs[j]), j))
+        scored.sort(reverse=True)
+        for sim, j in scored[:_GRAPH_SIM_TOPK]:
+            sims_all.append(sim)
+            if sim < _GRAPH_SIM_FLOOR:
+                continue
+            key = tuple(sorted((a['id'], ordered[j]['id'])))
+            if key in seen:
+                continue
+            seen.add(key)
+            edges.append({'s': key[0], 't': key[1], 'kind': 'similar', 'w': round(sim, 4)})
+
+    kinds: Dict[str, int] = {}
+    for n in nodes:
+        kinds[n['kind']] = kinds.get(n['kind'], 0) + 1
+    ekinds: Dict[str, int] = {}
+    for e in edges:
+        ekinds[e['kind']] = ekinds.get(e['kind'], 0) + 1
+    return {
+        'nodes': nodes,
+        'edges': edges,
+        'stats': {
+            'nodes': kinds, 'edges': ekinds,
+            'noise_entities': sum(1 for n in nodes if n.get('noise')),
+            'shared_entities': sum(1 for en in ent_name_by_id.values() if (en.get('mention_count') or 0) >= 2),
+            'sim_floor': _GRAPH_SIM_FLOOR, 'sim_topk': _GRAPH_SIM_TOPK,
+            'sim_max': round(max(sims_all), 4) if sims_all else None,
+            'generation_ms': int((time.time() - t0) * 1000),
+        },
+    }
+
+
 def get_full_snapshot() -> Dict[str, Any]:
     t0 = time.time()
     builtin = get_builtin_payload()
     limbic = get_limbic_payload()
     cm = get_cm_payload()
     cass = get_cass_payload()
+    try:
+        graph = get_memory_graph(builtin, limbic, cm)
+    except Exception as exc:  # graph is optional; never take the snapshot down with it
+        logger.exception('memory-studio: graph build failed')
+        graph = {'nodes': [], 'edges': [], 'stats': {}, 'error': str(exc)}
     return {
         'plugin': 'memory-studio',
         'version': '1.0.0',
@@ -979,4 +1161,5 @@ def get_full_snapshot() -> Dict[str, Any]:
         'limbic': limbic,
         'cm': cm,
         'cass': cass,
+        'graph': graph,
     }
