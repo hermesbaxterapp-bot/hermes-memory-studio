@@ -1274,7 +1274,7 @@ export default {
   version: '0.1.0',
   defaultEnabled: true,
   register(ctx) {
-    ctx.register([
+    ctx.registerMany([
       { id: 'route', area: ROUTES_AREA, data: { path: ROUTE }, render: () => h(MemoryStudioPage, { api: ctx }) },
       { id: 'nav', area: SIDEBAR_NAV_AREA, order: 57, data: { path: ROUTE, label: 'Memory Studio', codicon: 'database' } },
       {
